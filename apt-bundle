@@ -1,0 +1,224 @@
+#!/bin/bash
+#
+# APT bundle management.  Provide an console interface to install or
+# upgrade a system using a .tar.gz bundle of a Debian repository.
+#
+
+function conf-get {
+    # Get the main package to install in the bundle.
+    if [ ! -f $bundle_dir/repos/conf/distributions ]; then
+        echo 1>&2 "This is not a reprepro-bundle.  No repos/conf/distribution file." 
+        bundle-exit 1
+    fi
+
+    conf_val=`cat $bundle_dir/repos/conf/distributions | \
+        egrep "^\s*$1\s*:\s*" | \
+        tr -d " " | \
+        cut -d ':' -f 2`
+}
+
+# Cleanup the temporary directories.
+function bundle-cleanup {
+    if [ $keep -eq 0 ]; then
+        if [ -e $apt_cache ]; then
+            rm -rf $apt_cache; 
+        fi
+        if [ -e $apt_src ]; then
+            rm -rf $apt_src;
+        fi
+        if [ -e $bundle_dir ]; then
+            rm -rf $bundle_dir; 
+        fi
+    fi
+}
+
+# Cleanup.
+function bundle-exit {
+    bundle-cleanup
+    exit $1
+}
+
+# Extract the bundle in a temporary directory.
+function bundle-extract {
+    bundle_file=$1
+    bundle_dir=`mktemp -d /tmp/apt-bundle.XXXXXXX`
+
+    echo "Extracting $1..." > $verbose
+
+    if [ ! -e $bundle_file ]; then
+        echo "$bundle_file does not exists."
+        exit 1
+    else
+        if ! tar -C $bundle_dir -zxvf $bundle_file > /dev/null; then
+            echo 1>&2 "$bundle_file extraction failed."
+            bundle-exit 1
+        fi
+
+        n=`(cd $bundle_dir && find -type l) | wc -l`
+        if [ $n -gt 0 ]; then
+            echo 1>&2 "$n symbolic links found in bundle."
+            echo 1>&2 "The bundle might have been tampered with."
+            bundle-exit 1
+        fi
+
+        # Check if there is a 'repos' dir in the directory.
+        if [ ! -d $bundle_dir/repos ]; then
+            echo 1>&2 "$bundle_file incorrect.  It doesn't have a 'repos' directory." 
+            bundle-exit 1
+        fi
+    fi
+
+    echo "apt-bundle: Repository: $bundle_dir" > $verbose
+}
+
+# Make a temporary directory cache so we don't have to re-update from
+# the main apt sources after reading the package in the bundle.
+function bundle-make-cache {
+    apt_cache=`mktemp -d /tmp/apt-bundle.XXXXXXX`
+    apt_state=`mktemp -d /tmp/apt-bundle.XXXXXXX`
+    apt_opt_cache="-oDir::Cache=$apt_cache"
+    apt_opt_state="-oDir::State=$apt_state"
+
+    echo "apt-bundle: Cache directory: $apt_cache." > $verbose
+    echo "apt-bundle: State directory: $apt_state." > $verbose
+
+    mkdir -p $apt_state/lists/partial
+    mkdir -p $apt_cache/archives/partial
+
+    if ! apt-cache $apt_opt_cache $apt_opt_state gencaches; then
+        echo 1>&2 "Error generating temporary cache."
+        bundle-exit 1
+    fi
+}
+
+# Make a temporary apt source file.
+function bundle-make-src-list {
+    bundle_dir=$1
+
+    apt_src=`mktemp /tmp/apt-bundle.XXXXXXX`
+    apt_opt_src="-oDir::Etc::SourceList=$apt_src"
+
+    echo 1>&2 "apt-bundle: Apt source: $apt_src." > $verbose
+
+    conf-get 'Components'
+    components=$conf_val
+    conf-get 'Codename'
+    distribution=$conf_val
+    
+    echo "deb file://$bundle_dir/repos $distribution $components" > $apt_src    
+}
+
+# Calls dist-upgrade.
+function bundle-dist-upgrade {
+    bundle_file=$1
+
+    if ! apt-get -y $apt_opts dist-upgrade; then
+        echo 1>&2 "apt-get dist-upgrade failed on extracted bundle."
+        bundle-exit 1
+    fi
+
+    bundle-cleanup
+}
+
+# Calls upgrade.
+function bundle-upgrade {
+    bundle_file=$1
+
+    if ! apt-get -y $apt_opts dist-upgrade; then
+        echo 1>&2 "apt-get dist-upgrade failed on extracted bundle."
+        bundle-exit 1
+    fi
+
+    bundle-cleanup
+}
+
+# Calls install.  The install command check the repository
+# configuration and install the packages in 'Packages' entry.
+function bundle-install {
+    bundle_file=$1
+
+    conf-get "Packages"
+    packages=$conf_val
+    
+    echo "apt-bundle: Will install $packages." > $verbose
+
+    if ! apt-get -y $apt_opts install $packages; then
+        echo 1>&2 "apt-get install failed on extracted bundle."
+        bundle-exit 1
+    fi
+
+    bundle-cleanup
+}
+
+function bundle-help {
+    cat <<EOF
+apt-bundle v0.1 for Debian GNU/Linux
+Usage: apt-bundle command file.bundle
+
+apt-bundle is a small tool used to manipulated Debian repositories in
+compressed in single .bundle files."
+
+EOF
+    echo "Commands:"
+    echo "   install - Install the Packages of a bundle."
+    echo "   dist-upgrade - Calls apt-get dist-upgrade on a bundle."
+    echo "   upgrade - Calls apt-get upgrade on a bundle."
+}
+
+verbose=/dev/null
+keep=0
+
+# Parse the command line for options.
+function set-opt {
+    until [ -z "$1" ]; do
+        # Verbosity.
+        if [ "$1" == "-v" ]; then
+            verbose=/dev/stdout
+        fi
+
+        # Keep the temporary directories.
+        if [ "$1" == "-k" ]; then
+            keep=1
+        fi
+
+        shift
+    done
+}
+
+if [ -z "$1" -o -z "$2" ]; then
+    bundle-help
+    bundle-exit 1
+fi
+
+until [ -z "$1" ]; do
+    TEMP=`getopt -- kv $1`
+    if [ "$1" = "install" -o "$1" = "dist-upgrade" -o "$1" = "upgrade" ]; then
+        bundle-extract $2
+        bundle-make-src-list $bundle_dir
+        bundle-make-cache
+
+        apt_opts="$apt_opt_src $apt_opt_cache $apt_opt_state -oAPT::Get::AllowUnauthenticated=true"
+
+        if ! apt-get -y $apt_opts update; then
+            echo 1>&2 "apt-get update failed on extracted bundle."
+            bundle-exit 1
+        fi
+        
+        case "$1" in
+            dist-upgrade)
+                bundle-dist-upgrade $2
+                ;;
+            upgrade)
+                bundle-upgrade $2
+                ;;
+            install)
+                bundle-install $2
+                ;;
+            *)
+                echo "Unknown command \"$1\"." > /dev/stderr
+        esac
+    else
+        set-opt $TEMP
+    fi
+    shift
+done

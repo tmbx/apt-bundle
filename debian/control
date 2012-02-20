@@ -1,0 +1,13 @@
+Source: apt-bundle
+Priority: optional
+Maintainer:
+Build-Depends: debhelper (>= 4)
+Standards-Version: 3.7.2
+Section: libs
+
+Package: apt-bundle
+Section: other
+Architecture: any
+Depends: apt (>= 0.6)
+Description: APT bundle installer
+ This small program will expand and install the content of a .bundle file.
